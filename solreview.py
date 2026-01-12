@@ -5,6 +5,8 @@ Solidity Code Review Tool
 A terminal-based tool for dense, multi-column display of Solidity (.sol) files.
 """
 
+from __future__ import annotations
+
 import argparse
 import re
 import shutil
@@ -250,7 +252,7 @@ def create_file_separator(filename: str, width: int) -> list[str]:
     return [separator, name_line, separator]
 
 
-def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_height: int, names: set[str]) -> list[Page]:
+def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_height: int, bold_pattern: tuple[re.Pattern, str] | None) -> list[Page]:
     """Flow all content into pages with columns."""
     pages = []
     current_col = 0
@@ -270,7 +272,7 @@ def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_h
 
     def add_formatted_line(line: str) -> None:
         """Format and add a line to the current column."""
-        formatted = apply_bold(line, names)
+        formatted = apply_bold(line, bold_pattern)
         formatted = truncate_line(formatted, col_width)
         current_page.columns[current_col].append(formatted)
         col_heights[current_col] += 1
@@ -349,15 +351,22 @@ def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_h
 # Terminal Renderer
 # =============================================================================
 
-def apply_bold(line: str, names: set[str]) -> str:
-    """Apply bold formatting to definitions (keyword + name) only."""
+def build_bold_pattern(names: set[str]) -> tuple[re.Pattern, str] | None:
+    """Build a single compiled regex for all keyword+name definitions."""
     if not names:
+        return None
+    keyword_alt = '|'.join(re.escape(k) for k in DEFINITION_KEYWORDS)
+    name_alt = '|'.join(re.escape(n) for n in names)
+    pattern = re.compile(rf'\b({keyword_alt})(\s+)({name_alt})\b')
+    return pattern, f'{BOLD_BLUE}\\1\\2\\3{RESET}'
+
+
+def apply_bold(line: str, bold_pattern: tuple[re.Pattern, str] | None) -> str:
+    """Apply bold formatting to definitions using pre-compiled pattern."""
+    if not bold_pattern:
         return line
-    for keyword in DEFINITION_KEYWORDS:
-        for name in names:
-            pattern = r'\b(' + re.escape(keyword) + r')(\s+)(' + re.escape(name) + r')\b'
-            line = re.sub(pattern, f'{BOLD_BLUE}\\1\\2\\3{RESET}', line)
-    return line
+    pattern, replacement = bold_pattern
+    return pattern.sub(replacement, line)
 
 
 def render_page(page: Page, current_page: int, total_pages: int,
@@ -464,11 +473,12 @@ def run_viewer(folder: Path) -> None:
     files = [parse_file(f) for f in sol_files]
     print(" done.")
 
-    # Collect all names for bolding
+    # Collect all names for bolding and pre-compile pattern
     all_code = '\n'.join(
         line for f in files for block in f.blocks for line in block.lines
     )
     names = extract_names(all_code)
+    bold_pattern = build_bold_pattern(names)
 
     # Main loop
     current_page = 1
@@ -484,7 +494,7 @@ def run_viewer(folder: Path) -> None:
         page_height = terminal_height - 3  # Reserve for pagination
 
         # Generate pages
-        pages = flow_content(files, num_cols, col_width, page_height, names)
+        pages = flow_content(files, num_cols, col_width, page_height, bold_pattern)
         total_pages = len(pages)
 
         # Clamp current page
