@@ -6,7 +6,6 @@ A terminal-based tool for dense, multi-column display of Solidity (.sol) files.
 """
 
 import argparse
-import os
 import re
 import shutil
 import sys
@@ -14,7 +13,6 @@ import termios
 import tty
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 # =============================================================================
@@ -55,6 +53,15 @@ DIM = '\033[2m'           # Dim/faded
 RESET = '\033[0m'
 REVERSE = '\033[7m'
 CLEAR_SCREEN = '\033[2J\033[H'
+ANSI_PATTERN = re.compile(r'\033\[[0-9;]*m')
+
+# Keywords for Solidity definitions (order matters: 'abstract contract' before 'contract')
+DEFINITION_KEYWORDS = ['abstract contract', 'contract', 'library', 'interface', 'function', 'modifier', 'constructor']
+
+
+def visible_length(text: str) -> int:
+    """Return the visible length of text, excluding ANSI escape codes."""
+    return len(ANSI_PATTERN.sub('', text))
 
 
 # =============================================================================
@@ -69,23 +76,11 @@ def strip_comments(code: str) -> str:
 
     while i < n:
         # Check for string literals (preserve them)
-        if code[i] == '"':
+        if code[i] in ('"', "'"):
+            quote_char = code[i]
             result.append(code[i])
             i += 1
-            while i < n and code[i] != '"':
-                if code[i] == '\\' and i + 1 < n:
-                    result.append(code[i:i+2])
-                    i += 2
-                else:
-                    result.append(code[i])
-                    i += 1
-            if i < n:
-                result.append(code[i])
-                i += 1
-        elif code[i] == "'":
-            result.append(code[i])
-            i += 1
-            while i < n and code[i] != "'":
+            while i < n and code[i] != quote_char:
                 if code[i] == '\\' and i + 1 < n:
                     result.append(code[i:i+2])
                     i += 2
@@ -123,23 +118,10 @@ def clean_empty_lines(code: str) -> str:
 def extract_names(code: str) -> set[str]:
     """Extract function, contract, library, and interface names for bolding."""
     names = set()
-
-    # Contract/library/interface names
-    for match in re.finditer(r'\b(contract|library|interface)\s+(\w+)', code):
-        names.add(match.group(2))
-
-    # Abstract contract
-    for match in re.finditer(r'\babstract\s+contract\s+(\w+)', code):
-        names.add(match.group(1))
-
-    # Function names
-    for match in re.finditer(r'\bfunction\s+(\w+)', code):
-        names.add(match.group(1))
-
-    # Modifier names
-    for match in re.finditer(r'\bmodifier\s+(\w+)', code):
-        names.add(match.group(1))
-
+    for keyword in DEFINITION_KEYWORDS:
+        pattern = r'\b' + keyword.replace(' ', r'\s+') + r'\s+(\w+)'
+        for match in re.finditer(pattern, code):
+            names.add(match.group(1))
     return names
 
 
@@ -271,41 +253,31 @@ def create_file_separator(filename: str, width: int) -> list[str]:
 def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_height: int, names: set[str]) -> list[Page]:
     """Flow all content into pages with columns."""
     pages = []
-    current_page = Page(columns=[[] for _ in range(num_cols)])
     current_col = 0
     col_heights = [0] * num_cols
 
-    def add_lines_to_column(lines: list[str], col: int) -> int:
-        """Add lines to a column, return new column index if overflow."""
-        nonlocal current_page, col_heights, pages
+    def new_page() -> Page:
+        """Create a new page and reset column heights."""
+        nonlocal col_heights
+        col_heights = [0] * num_cols
+        return Page(columns=[[] for _ in range(num_cols)])
 
-        for line in lines:
-            # Apply bold to names
-            formatted = apply_bold(line, names)
-            formatted = truncate_line(formatted, col_width)
-
-            if col_heights[col] >= page_height:
-                # Move to next column
-                col += 1
-                if col >= num_cols:
-                    # Start new page
-                    pages.append(current_page)
-                    current_page = Page(columns=[[] for _ in range(num_cols)])
-                    col_heights = [0] * num_cols
-                    col = 0
-
-            current_page.columns[col].append(formatted)
-            col_heights[col] += 1
-
-        return col
+    current_page = new_page()
 
     def space_available(col: int, needed: int) -> bool:
         """Check if there's space in current column."""
         return col_heights[col] + needed <= page_height
 
+    def add_formatted_line(line: str) -> None:
+        """Format and add a line to the current column."""
+        formatted = apply_bold(line, names)
+        formatted = truncate_line(formatted, col_width)
+        current_page.columns[current_col].append(formatted)
+        col_heights[current_col] += 1
+
     def find_column_for_block(block_height: int) -> int:
         """Find a column that can fit the block, or start new page."""
-        nonlocal current_page, col_heights, pages, current_col
+        nonlocal current_page, current_col
 
         # First check current column
         if space_available(current_col, block_height):
@@ -318,8 +290,7 @@ def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_h
 
         # Need new page
         pages.append(current_page)
-        current_page = Page(columns=[[] for _ in range(num_cols)])
-        col_heights = [0] * num_cols
+        current_page = new_page()
         return 0
 
     for file_content in files:
@@ -350,8 +321,7 @@ def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_h
                         current_col += 1
                         if current_col >= num_cols:
                             pages.append(current_page)
-                            current_page = Page(columns=[[] for _ in range(num_cols)])
-                            col_heights = [0] * num_cols
+                            current_page = new_page()
                             current_col = 0
                         available = page_height
 
@@ -359,20 +329,14 @@ def flow_content(files: list[FileContent], num_cols: int, col_width: int, page_h
                     remaining_lines = remaining_lines[available:]
 
                     for line in chunk:
-                        formatted = apply_bold(line, names)
-                        formatted = truncate_line(formatted, col_width)
-                        current_page.columns[current_col].append(formatted)
-                        col_heights[current_col] += 1
+                        add_formatted_line(line)
             else:
                 # Normal block - find column where it fits
                 target_col = find_column_for_block(block_height)
                 current_col = target_col
 
                 for line in block.lines:
-                    formatted = apply_bold(line, names)
-                    formatted = truncate_line(formatted, col_width)
-                    current_page.columns[current_col].append(formatted)
-                    col_heights[current_col] += 1
+                    add_formatted_line(line)
 
     # Don't forget the last page
     if any(col for col in current_page.columns):
@@ -389,24 +353,10 @@ def apply_bold(line: str, names: set[str]) -> str:
     """Apply bold formatting to definitions (keyword + name) only."""
     if not names:
         return line
-
-    # Keywords that precede names in definitions
-    keywords = [
-        'abstract contract',  # Must come before 'contract'
-        'contract',
-        'library',
-        'interface',
-        'function',
-        'modifier',
-        'constructor',
-    ]
-
-    # Only highlight keyword + name combinations (definitions only)
-    for keyword in keywords:
+    for keyword in DEFINITION_KEYWORDS:
         for name in names:
             pattern = r'\b(' + re.escape(keyword) + r')(\s+)(' + re.escape(name) + r')\b'
             line = re.sub(pattern, f'{BOLD_BLUE}\\1\\2\\3{RESET}', line)
-
     return line
 
 
@@ -436,8 +386,7 @@ def render_page(page: Page, current_page: int, total_pages: int,
         for col_idx, col in enumerate(padded_columns):
             line = col[row_idx] if row_idx < len(col) else ''
             # Pad line to column width (accounting for ANSI codes)
-            visible_len = len(re.sub(r'\033\[[0-9;]*m', '', line))
-            padding = ' ' * max(0, col_width - visible_len)
+            padding = ' ' * max(0, col_width - visible_length(line))
             row_parts.append(line + padding)
 
         output.append(separator.join(row_parts))
@@ -471,8 +420,7 @@ def render_pagination(current: int, total: int, width: int) -> str:
     full_line = pagination + hint
 
     # Center it
-    visible_len = len(re.sub(r'\033\[[0-9;]*m', '', full_line))
-    padding = ' ' * max(0, (width - visible_len) // 2)
+    padding = ' ' * max(0, (width - visible_length(full_line)) // 2)
 
     return padding + full_line
 
@@ -498,14 +446,8 @@ def getch() -> str:
 # =============================================================================
 
 def discover_sol_files(folder: Path) -> list[Path]:
-    """Recursively find all .sol files in a folder."""
-    sol_files = []
-    for path in folder.rglob('*.sol'):
-        if path.is_file():
-            sol_files.append(path)
-
-    # Sort by path for consistent ordering
-    return sorted(sol_files)
+    """Recursively find all .sol files in a folder, sorted by path."""
+    return sorted(p for p in folder.rglob('*.sol') if p.is_file())
 
 
 def run_viewer(folder: Path) -> None:
@@ -524,8 +466,7 @@ def run_viewer(folder: Path) -> None:
 
     # Collect all names for bolding
     all_code = '\n'.join(
-        '\n'.join('\n'.join(block.lines) for block in f.blocks)
-        for f in files
+        line for f in files for block in f.blocks for line in block.lines
     )
     names = extract_names(all_code)
 
