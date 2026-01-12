@@ -2,6 +2,10 @@
 
 A terminal-based Solidity code review tool with dense, multi-column display.
 
+Vibecoded. Use at your own risk. No depenencies.
+
+![Screenshot of interface](screenshot.png)
+
 ## Usage
 
 ```bash
